@@ -2,7 +2,7 @@
 
 A free, open-source (MIT) PowerShell module for SQL Server **reliability engineering** — backup recoverability, restore-chain validation, disaster-recovery drift detection, backup anomaly detection, and Query Store regression analysis. Built on top of [dbatools](https://dbatools.io).
 
-> Status: early / active development (v0.1.0). Feedback and issues welcome.
+> Status: early / active development (v0.2.0). Feedback and issues welcome.
 
 ## Why this module
 
