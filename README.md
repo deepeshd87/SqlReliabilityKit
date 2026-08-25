@@ -16,8 +16,21 @@ dbatools is superb for general SQL Server administration. SqlReliabilityKit focu
 
 ## Install
 
+Install from the [PowerShell Gallery](https://www.powershellgallery.com/packages/SqlReliabilityKit):
+
 ```powershell
-# From source (until published to the PowerShell Gallery)
+Install-Module SqlReliabilityKit -Scope CurrentUser
+```
+
+To update to the latest version:
+
+```powershell
+Update-Module SqlReliabilityKit
+```
+
+Or install from source:
+
+```powershell
 git clone https://github.com/deepeshd87/SqlReliabilityKit.git
 Import-Module ./SqlReliabilityKit/SqlReliabilityKit.psd1
 ```
