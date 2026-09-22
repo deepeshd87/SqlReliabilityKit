@@ -2,7 +2,7 @@
 
 A free, open-source (MIT) PowerShell module for SQL Server **reliability engineering** — backup recoverability, restore-chain validation, and Query Store regression analysis, with disaster-recovery drift detection and backup anomaly detection planned. Built on top of [dbatools](https://dbatools.io).
 
-> Status: early / active development (v0.6.0). Feedback and issues welcome.
+> Status: early / active development (v0.7.0). Feedback and issues welcome.
 
 ## Why this module
 
@@ -35,15 +35,32 @@ git clone https://github.com/deepeshd87/SqlReliabilityKit.git
 Import-Module ./SqlReliabilityKit/SqlReliabilityKit.psd1
 ```
 
+## Authentication
+
+All commands accept `-SqlCredential` for SQL Server authentication. When omitted, they use
+Windows Authentication (your current login):
+
+```powershell
+# Windows Authentication (default)
+Find-SqlQueryStoreRegression -SqlInstance sql01 -Database Sales
+
+# SQL Server authentication
+$cred = Get-Credential
+Find-SqlQueryStoreRegression -SqlInstance sql01 -Database Sales -SqlCredential $cred
+```
+
+For connections to instances with self-signed certificates, add `-TrustServerCertificate`.
+
 ## Commands
 
 ### `Find-SqlQueryStoreRegression`
 
 Detects query performance regressions from Query Store runtime statistics using an
 **execution-weighted baseline**. Instead of a naive "yesterday vs today average" — which
-hides spikes and over-weights rarely-run queries — it weights each plan's historical
-duration by execution count and filters out low-frequency, low-impact noise, so genuine
-regressions surface.
+hides spikes and over-weights rarely-run queries — it weights each query's historical
+performance by execution count and filters out low-frequency, low-impact noise, so genuine
+regressions surface. By default it compares average duration, but `-Metric` lets you detect
+regressions in CPU time or logical reads instead.
 
 Read-only: it reads Query Store DMVs and returns objects. It does not force plans or change
 configuration.
@@ -55,10 +72,19 @@ Find-SqlQueryStoreRegression -SqlInstance sql01 -Database AdventureWorks
 # Only regressions that at least doubled, on queries run 50+ times
 Find-SqlQueryStoreRegression -SqlInstance sql01 -Database Sales -SlowdownThreshold 2.0 -MinExecutionCount 50
 
+# Detect regressions by CPU time or logical reads instead of duration
+Find-SqlQueryStoreRegression -SqlInstance sql01 -Database Sales -Metric CpuTime
+Find-SqlQueryStoreRegression -SqlInstance sql01 -Database Sales -Metric LogicalReads
+
 # Ten worst regressions by factor
 Find-SqlQueryStoreRegression -SqlInstance sql01 -Database Sales |
     Sort-Object SlowdownFactor -Descending | Select-Object -First 10
 ```
+
+Each result reports the metric compared (`Metric`, `Unit`), the baseline and current values,
+the `SlowdownFactor`, and `PlanChanged` — which flags whether a genuinely new execution plan
+appeared in the current window (a plan not seen in the baseline), rather than merely running
+under more than one plan.
 
 The underlying technique is described here:
 <https://dzone.com/articles/sql-server-query-store-regression>
