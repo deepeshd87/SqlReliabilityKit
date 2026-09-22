@@ -108,11 +108,17 @@ function Find-SqlQueryStoreRegression {
         [ValidateSet('Day', 'Hour', 'Minute')]
         [string]$WindowUnit = 'Day',
 
+        [ValidateSet('Duration', 'CpuTime', 'LogicalReads')]
+        [string]$Metric = 'Duration',
+
         [ValidateRange(1.0, 1000.0)]
         [double]$SlowdownThreshold = 1.5,
 
         [ValidateRange(1, [int]::MaxValue)]
         [int]$MinExecutionCount = 20,
+
+        [ValidateRange(1, [int]::MaxValue)]
+        [int]$MinBaselineExecutionCount = 20,
 
         [ValidateRange(0, [long]::MaxValue)]
         [long]$MinTotalDurationMs = 100,
@@ -130,6 +136,31 @@ function Find-SqlQueryStoreRegression {
 
         # Query Store stores durations in microseconds. Convert the ms floor to us.
         $minTotalDurationUs = $MinTotalDurationMs * 1000
+
+        # Map the chosen metric to its Query Store column, its unit, the divisor that turns
+        # the raw stored value into the reported unit, and the output-column suffix. Duration
+        # and CPU are stored in microseconds (report as ms, divide by 1000); logical reads is
+        # a page COUNT (no unit conversion - divide by 1). Getting this right matters: dividing
+        # a read count by 1000 would silently report nonsense.
+        $metricMap = @{
+            'Duration'     = @{ Column = 'avg_duration';         Divisor = 1000.0; Suffix = 'Ms';    TotalFloorColumn = $true }
+            'CpuTime'      = @{ Column = 'avg_cpu_time';         Divisor = 1000.0; Suffix = 'Ms';    TotalFloorColumn = $false }
+            'LogicalReads' = @{ Column = 'avg_logical_io_reads'; Divisor = 1.0;    Suffix = 'Reads'; TotalFloorColumn = $false }
+        }
+        $m           = $metricMap[$Metric]
+        $metricCol   = $m.Column
+        $metricDiv   = $m.Divisor
+        $metricSuffix = $m.Suffix
+
+        # The MinTotalDurationMs floor is a duration concept (total microseconds of runtime).
+        # It only makes sense when the metric IS Duration; for CPU or reads, a microsecond floor
+        # against a different unit would be nonsense, so we omit the clause entirely for those.
+        # This keeps v1 unambiguous - the total-impact filter applies to Duration only.
+        if ($m.TotalFloorColumn) {
+            $totalFloorClause = '  AND c.current_total_metric > @minTotalDurationUs'
+        } else {
+            $totalFloorClause = ''
+        }
 
         # DATEADD unit: 'day', 'hour', or 'minute' depending on WindowUnit.
         $dateUnit = switch ($WindowUnit) {
@@ -151,10 +182,9 @@ DECLARE @CurrentStart  datetimeoffset = @BaselineEnd;
 WITH baseline AS (
     SELECT
         q.query_id,
-        SUM(rs.avg_duration * rs.count_executions) * 1.0
-            / NULLIF(SUM(rs.count_executions), 0) AS baseline_duration,
-        SUM(rs.count_executions)                  AS baseline_exec_count,
-        COUNT(DISTINCT p.plan_id)                 AS baseline_plan_count
+        SUM(rs.$metricCol * rs.count_executions) * 1.0
+            / NULLIF(SUM(rs.count_executions), 0) AS baseline_metric,
+        SUM(rs.count_executions)                  AS baseline_exec_count
     FROM sys.query_store_runtime_stats rs
     JOIN sys.query_store_plan  p ON rs.plan_id  = p.plan_id
     JOIN sys.query_store_query q ON p.query_id  = q.query_id
@@ -165,33 +195,64 @@ WITH baseline AS (
 current_perf AS (
     SELECT
         q.query_id,
-        SUM(rs.avg_duration * rs.count_executions) * 1.0
-            / NULLIF(SUM(rs.count_executions), 0) AS current_duration,
+        SUM(rs.$metricCol * rs.count_executions) * 1.0
+            / NULLIF(SUM(rs.count_executions), 0) AS current_metric,
         SUM(rs.count_executions)                  AS current_exec_count,
-        SUM(rs.avg_duration * rs.count_executions) AS current_total_duration,
-        COUNT(DISTINCT p.plan_id)                 AS current_plan_count
+        SUM(rs.$metricCol * rs.count_executions)  AS current_total_metric
     FROM sys.query_store_runtime_stats rs
     JOIN sys.query_store_plan  p ON rs.plan_id  = p.plan_id
     JOIN sys.query_store_query q ON p.query_id  = q.query_id
     WHERE rs.last_execution_time >= @CurrentStart
     GROUP BY q.query_id
+),
+-- Distinct plan_ids actually executed in each window.
+baseline_plans AS (
+    SELECT DISTINCT q.query_id, rs.plan_id
+    FROM sys.query_store_runtime_stats rs
+    JOIN sys.query_store_plan  p ON rs.plan_id  = p.plan_id
+    JOIN sys.query_store_query q ON p.query_id  = q.query_id
+    WHERE rs.last_execution_time >= @BaselineStart
+      AND rs.last_execution_time <  @BaselineEnd
+),
+current_plans AS (
+    SELECT DISTINCT q.query_id, rs.plan_id
+    FROM sys.query_store_runtime_stats rs
+    JOIN sys.query_store_plan  p ON rs.plan_id  = p.plan_id
+    JOIN sys.query_store_query q ON p.query_id  = q.query_id
+    WHERE rs.last_execution_time >= @CurrentStart
+),
+-- A real plan change: a plan_id running NOW that was NOT running in the baseline.
+-- Count-of-plans is not enough (a query may always run under several stable plans);
+-- what signals a change is a genuinely new plan appearing in the current window.
+new_plans AS (
+    SELECT cp.query_id, COUNT(*) AS new_plan_count
+    FROM current_plans cp
+    WHERE NOT EXISTS (
+        SELECT 1 FROM baseline_plans bp
+        WHERE bp.query_id = cp.query_id
+          AND bp.plan_id  = cp.plan_id
+    )
+    GROUP BY cp.query_id
 )
 SELECT
     c.query_id                                                    AS QueryId,
-    CAST(b.baseline_duration / 1000.0 AS DECIMAL(18,2))           AS BaselineDurationMs,
-    CAST(c.current_duration  / 1000.0 AS DECIMAL(18,2))           AS CurrentDurationMs,
-    CAST(c.current_duration * 1.0
-        / NULLIF(b.baseline_duration, 0) AS DECIMAL(10,2))        AS SlowdownFactor,
+    CAST(b.baseline_metric / $metricDiv AS DECIMAL(18,2))         AS Baseline$metricSuffix,
+    CAST(c.current_metric  / $metricDiv AS DECIMAL(18,2))         AS Current$metricSuffix,
+    CAST(c.current_metric * 1.0
+        / NULLIF(b.baseline_metric, 0) AS DECIMAL(10,2))          AS SlowdownFactor,
     b.baseline_exec_count                                         AS BaselineExecCount,
     c.current_exec_count                                          AS CurrentExecCount,
-    CASE WHEN c.current_plan_count > b.baseline_plan_count OR c.current_plan_count > 1
+    CASE WHEN np.new_plan_count > 0
          THEN CAST(1 AS bit) ELSE CAST(0 AS bit) END              AS PlanChanged
 FROM current_perf c
 JOIN baseline b
     ON c.query_id = b.query_id
-WHERE c.current_duration     > b.baseline_duration * @SlowdownThreshold
-  AND c.current_exec_count   > @MinExecutionCount
-  AND c.current_total_duration > @minTotalDurationUs
+LEFT JOIN new_plans np
+    ON np.query_id = c.query_id
+WHERE c.current_metric        > b.baseline_metric * @SlowdownThreshold
+  AND c.current_exec_count    > @MinExecutionCount
+  AND b.baseline_exec_count   > @MinBaselineExecutionCount
+$totalFloorClause
 ORDER BY SlowdownFactor DESC;
 "@
     }
@@ -223,9 +284,10 @@ ORDER BY SlowdownFactor DESC;
                     SqlParameter = @{
                         BaselineStartOffset = $BaselineStart
                         BaselineEndOffset   = $BaselineEnd
-                        SlowdownThreshold    = $SlowdownThreshold
-                        MinExecutionCount    = $MinExecutionCount
-                        minTotalDurationUs   = $minTotalDurationUs
+                        SlowdownThreshold        = $SlowdownThreshold
+                        MinExecutionCount        = $MinExecutionCount
+                        MinBaselineExecutionCount = $MinBaselineExecutionCount
+                        minTotalDurationUs       = $minTotalDurationUs
                     }
                     EnableException = $true
                 }
@@ -238,18 +300,40 @@ ORDER BY SlowdownFactor DESC;
                     if ($EnableException) { throw } else { Write-Warning $msg; continue }
                 }
 
+                # Output columns carry a metric-specific suffix in SQL (Baseline$metricSuffix),
+                # but we surface STABLE property names so a pipeline consuming this doesn't break
+                # when -Metric changes. The Metric and Unit columns say which metric these numbers
+                # describe. 'Ms' -> milliseconds; 'Reads' -> logical page reads.
+                $baselineProp = "Baseline$metricSuffix"
+                $currentProp  = "Current$metricSuffix"
+                $unit = if ($metricSuffix -eq 'Ms') { 'ms' } else { 'reads' }
+
                 foreach ($row in $rows) {
-                    [PSCustomObject]@{
+                    $out = [ordered]@{
                         SqlInstance       = "$instance"
                         Database          = $db
                         QueryId           = $row.QueryId
-                        BaselineDurationMs = $row.BaselineDurationMs
-                        CurrentDurationMs  = $row.CurrentDurationMs
-                        SlowdownFactor     = $row.SlowdownFactor
-                        PlanChanged        = [bool]$row.PlanChanged
-                        BaselineExecCount  = $row.BaselineExecCount
-                        CurrentExecCount   = $row.CurrentExecCount
+                        Metric            = $Metric
+                        Unit              = $unit
+                        BaselineValue     = $row.$baselineProp
+                        CurrentValue      = $row.$currentProp
+                        SlowdownFactor    = $row.SlowdownFactor
+                        PlanChanged       = [bool]$row.PlanChanged
+                        BaselineExecCount = $row.BaselineExecCount
+                        CurrentExecCount  = $row.CurrentExecCount
                     }
+
+                    # Backward compatibility: prior versions exposed BaselineDurationMs /
+                    # CurrentDurationMs. Those names were duration-specific, so we keep emitting
+                    # them ONLY for -Metric Duration, alongside the new metric-agnostic columns.
+                    # Scripts and docs written against the old names keep working; CpuTime and
+                    # LogicalReads runs don't carry them (they never applied to those metrics).
+                    if ($Metric -eq 'Duration') {
+                        $out.BaselineDurationMs = $row.$baselineProp
+                        $out.CurrentDurationMs  = $row.$currentProp
+                    }
+
+                    [PSCustomObject]$out
                 }
             }
         }
