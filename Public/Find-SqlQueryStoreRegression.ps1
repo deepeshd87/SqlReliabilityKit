@@ -125,6 +125,13 @@ function Find-SqlQueryStoreRegression {
 
         [switch]$TrustServerCertificate,
 
+        # Attach a per-query wait-category breakdown (from sys.query_store_wait_stats) to each
+        # regression, showing what the query waited ON in the current window - a strong hint at
+        # WHY it slowed (I/O, memory grant, locking, CPU). Requires SQL Server 2017+; on 2016
+        # the DMV does not exist, so the switch is ignored with a warning and regressions are
+        # still returned. Wait category indicates what a query waited on, not a proven cause.
+        [switch]$IncludeWaitStats,
+
         [switch]$EnableException
     )
 
@@ -300,6 +307,68 @@ ORDER BY SlowdownFactor DESC;
                     if ($EnableException) { throw } else { Write-Warning $msg; continue }
                 }
 
+                # -----------------------------------------------------------------------------
+                # Optional wait-category breakdown (SQL Server 2017+ only).
+                # sys.query_store_wait_stats does not exist on 2016, so we gate on version:
+                # on 2016 we warn once and skip, still returning the regressions themselves.
+                # We fetch waits in ONE query for all regressed query_ids in this database,
+                # then group them in PowerShell - keeping the proven regression SQL untouched.
+                # $waitsByQuery maps query_id -> array of [category, wait_ms] for attaching below.
+                # -----------------------------------------------------------------------------
+                $waitsByQuery = @{}
+                if ($IncludeWaitStats -and $rows) {
+                    # $server.VersionMajor: 13 = 2016, 14 = 2017, 15 = 2019, 16 = 2022.
+                    if ($server.VersionMajor -lt 14) {
+                        Write-Warning "[$instance].[$db]: -IncludeWaitStats requires SQL Server 2017+ (this is major version $($server.VersionMajor)). Returning regressions without wait breakdown."
+                    }
+                    else {
+                        $queryIdList = ($rows | ForEach-Object { [int]$_.QueryId }) -join ','
+                        # wait_category_desc is provided by the DMV, so no manual enum mapping is
+                        # needed. Sum per query+category over the current window; drop zero rows.
+                        $waitSql = @"
+DECLARE @CurrentStart datetimeoffset = DATEADD($dateUnit, -@CurrentOffset, SYSDATETIMEOFFSET());
+-- query_store_wait_stats has no last_execution_time column; the current window is expressed
+-- by joining the runtime-stats interval table and filtering on its start_time. total_query_wait_time_ms
+-- is the DMV's own total, so no manual avg * count arithmetic is needed.
+SELECT
+    q.query_id                                        AS QueryId,
+    ws.wait_category_desc                             AS WaitCategory,
+    CAST(SUM(ws.total_query_wait_time_ms) AS DECIMAL(18,2)) AS TotalWaitMs
+FROM sys.query_store_wait_stats ws
+JOIN sys.query_store_plan p ON ws.plan_id = p.plan_id
+JOIN sys.query_store_query q ON p.query_id = q.query_id
+JOIN sys.query_store_runtime_stats_interval rsi ON ws.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+WHERE rsi.start_time >= @CurrentStart
+  AND q.query_id IN ($queryIdList)
+GROUP BY q.query_id, ws.wait_category_desc
+HAVING SUM(ws.total_query_wait_time_ms) > 0
+ORDER BY q.query_id, TotalWaitMs DESC;
+"@
+                        $waitParams = @{
+                            SqlInstance  = $server
+                            Database     = $db
+                            Query        = $waitSql
+                            SqlParameter = @{ CurrentOffset = $BaselineEnd }
+                            EnableException = $true
+                        }
+                        try {
+                            $waitRows = Invoke-DbaQuery @waitParams
+                            foreach ($wr in $waitRows) {
+                                $qid = [int]$wr.QueryId
+                                if (-not $waitsByQuery.ContainsKey($qid)) { $waitsByQuery[$qid] = [System.Collections.Generic.List[object]]::new() }
+                                $waitsByQuery[$qid].Add([PSCustomObject]@{
+                                    Category = $wr.WaitCategory
+                                    WaitMs   = $wr.TotalWaitMs
+                                })
+                            }
+                        }
+                        catch {
+                            # Wait-stats is supplementary; never let its failure lose the regressions.
+                            Write-Warning "[$instance].[$db]: wait-stats query failed ($($_.Exception.Message)); returning regressions without wait breakdown."
+                        }
+                    }
+                }
+
                 # Output columns carry a metric-specific suffix in SQL (Baseline$metricSuffix),
                 # but we surface STABLE property names so a pipeline consuming this doesn't break
                 # when -Metric changes. The Metric and Unit columns say which metric these numbers
@@ -331,6 +400,15 @@ ORDER BY SlowdownFactor DESC;
                     if ($Metric -eq 'Duration') {
                         $out.BaselineDurationMs = $row.$baselineProp
                         $out.CurrentDurationMs  = $row.$currentProp
+                    }
+
+                    # When wait-stats were requested, attach the per-category breakdown for this
+                    # query as a nested WaitStats collection (empty array if the query had no
+                    # recorded waits, or if wait-stats were skipped/failed). Only present when the
+                    # switch is used, so default output shape is unchanged.
+                    if ($IncludeWaitStats) {
+                        $qid = [int]$row.QueryId
+                        $out.WaitStats = if ($waitsByQuery.ContainsKey($qid)) { $waitsByQuery[$qid].ToArray() } else { @() }
                     }
 
                     [PSCustomObject]$out
