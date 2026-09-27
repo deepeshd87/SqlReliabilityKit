@@ -2,7 +2,7 @@
 
 A free, open-source (MIT) PowerShell module for SQL Server **reliability engineering** — backup recoverability, restore-chain validation, and Query Store regression analysis, with disaster-recovery drift detection and backup anomaly detection planned. Built on top of [dbatools](https://dbatools.io).
 
-> Status: early / active development (v0.7.0). Feedback and issues welcome.
+> Status: early / active development (v0.8.0). Feedback and issues welcome.
 
 ## Why this module
 
@@ -85,6 +85,27 @@ Each result reports the metric compared (`Metric`, `Unit`), the baseline and cur
 the `SlowdownFactor`, and `PlanChanged` — which flags whether a genuinely new execution plan
 appeared in the current window (a plan not seen in the baseline), rather than merely running
 under more than one plan.
+
+#### Wait-statistics breakdown
+
+Add `-IncludeWaitStats` to attach a per-query wait-category breakdown to each regression,
+showing what the query waited on in the current window — a strong hint at *why* it slowed
+(I/O, memory grant, CPU, locking). Each result gains a nested `WaitStats` collection of
+category/millisecond pairs. Requires SQL Server 2017+ (the `sys.query_store_wait_stats` DMV);
+on SQL Server 2016 the switch is ignored with a warning and regressions are still returned.
+
+```powershell
+# Regressions with their dominant waits expanded
+Find-SqlQueryStoreRegression -SqlInstance sql01 -Database Sales -IncludeWaitStats |
+    Select-Object QueryId, SlowdownFactor -ExpandProperty WaitStats
+
+# The nested breakdown is available per result object
+$r = Find-SqlQueryStoreRegression -SqlInstance sql01 -Database Sales -IncludeWaitStats
+$r[0].WaitStats   # e.g. Buffer IO 10845ms, Memory 8492ms, CPU 8007ms
+```
+
+Wait category indicates what a query waited on, not a proven root cause — a query can be
+I/O-bound simply because it is now doing more work. Treat it as a diagnostic starting point.
 
 The underlying technique is described here:
 <https://dzone.com/articles/sql-server-query-store-regression>
