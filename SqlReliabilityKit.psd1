@@ -1,6 +1,6 @@
 @{
     RootModule        = 'SqlReliabilityKit.psm1'
-    ModuleVersion     = '0.6.0'
+    ModuleVersion     = '0.8.0'
     GUID              = '0f3c9a2e-8b1d-4c7a-9e2f-1a6b5d4c3e2f'
     Author            = 'Deepesh Dhake'
     CompanyName       = 'Deepesh Dhake'
